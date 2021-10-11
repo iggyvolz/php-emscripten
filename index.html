@@ -1,0 +1,13 @@
+<!DOCTYPE HTML>
+<html>
+    <head>
+        <script>window.Module = window.Module ?? {}; window.Module['print'] = x => document.getElementById("output").innerText = x;</script>
+        <script src="php.js"></script>
+        <script>window.php = Module.cwrap('run_php', 'number', ['string'])</script>
+    </head>
+    <body>
+        <textarea id="input"></textarea>
+        <button onclick="php(document.getElementById('input').value)">Submit</button>
+        <textarea id="output" readonly></textarea>
+    </body>
+</html>
