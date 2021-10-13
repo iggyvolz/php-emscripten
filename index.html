@@ -1,13 +1,29 @@
 <!DOCTYPE HTML>
 <html>
-    <head>
-        <script>window.Module = window.Module ?? {}; window.Module['print'] = x => document.getElementById("output").innerText = x;</script>
-        <script src="php.js"></script>
-        <script>window.php = Module.cwrap('run_php', 'number', ['string'])</script>
-    </head>
-    <body>
-        <textarea id="input"></textarea>
-        <button onclick="php(document.getElementById('input').value)">Submit</button>
-        <textarea id="output" readonly></textarea>
-    </body>
+
+<head>
+    <script>
+        let html = false;
+        window.Module = window.Module ?? {}; window.Module['print'] = x =>{
+            if(html) {
+                document.getElementById("outputHtml").contentWindow.document.write(x + "\n");
+            } else {
+                document.getElementById("output").value += x + "\n";
+            }
+        }
+    </script>
+    <script src="php.js"></script>
+    <script>window.php = Module.cwrap('run_php', 'number', ['string'])</script>
+</head>
+
+<body>
+    <textarea id="input"></textarea>
+    <button onclick="document.getElementById('output').value='';Array.from(document.getElementById('outputHtml').contentWindow.document.children).forEach(c => c.remove());php(document.getElementById('input').value)">Submit</button>
+    <label><input type="radio" name="type" checked onclick="html=false;document.querySelector('#output').style.display='block';document.querySelector('#outputHtml').style.display='none';">Text</label>
+    <label><input type="radio" name="type" onclick="html=true;document.querySelector('#outputHtml').style.display='block';document.querySelector('#output').style.display='none';">HTML</label>
+    <br>
+    <textarea id="output" readonly style="width: 95vw; height:75vh;"></textarea>
+    <iframe id="outputHtml" style="display:none;width: 95vw; height:75vh;"></div>
+</body>
+
 </html>
