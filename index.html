@@ -3,7 +3,7 @@
 
 <head>
     <script>
-        let html = false;
+        let html = true;
         window.Module = window.Module ?? {}; window.Module['print'] = x =>{
             if(html) {
                 document.getElementById("outputHtml").contentWindow.document.write(x + "\n");
@@ -19,11 +19,12 @@
 <body>
     <textarea id="input"></textarea>
     <button onclick="document.getElementById('output').value='';document.getElementById('outputHtml').src='';setTimeout(() => php(document.getElementById('input').value), 10)">Submit</button>
-    <label><input type="radio" name="type" checked onclick="html=false;document.querySelector('#output').style.display='block';document.querySelector('#outputHtml').style.display='none';">Text</label>
-    <label><input type="radio" name="type" onclick="html=true;document.querySelector('#outputHtml').style.display='block';document.querySelector('#output').style.display='none';">HTML</label>
+    <label><input type="radio" name="type" onclick="html=false;document.querySelector('#output').style.display='block';document.querySelector('#outputHtml').style.display='none';">Text</label>
+    <label><input type="radio" name="type" checked onclick="html=true;document.querySelector('#outputHtml').style.display='block';document.querySelector('#output').style.display='none';">HTML</label>
     <br>
-    <textarea id="output" readonly style="width: 95vw; height:75vh;"></textarea>
-    <iframe id="outputHtml" style="display:none;width: 95vw; height:75vh;"></div>
+    <textarea id="output" readonly style="display:none;width: 95vw; height:75vh;"></textarea>
+    <iframe id="outputHtml" style="width: 95vw; height:75vh;"></iframe>
+    <script>setTimeout(() => php("phpinfo();"), 1000)</script>
 </body>
 
 </html>
