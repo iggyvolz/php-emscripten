@@ -4,27 +4,44 @@
 <head>
     <script>
         let html = true;
-        window.Module = window.Module ?? {}; window.Module['print'] = x =>{
+        const stdoutCallback = (data) => {
+            const str = Array.from(data).map(x => String.fromCharCode(x)).join('')
+
             if(html) {
-                document.getElementById("outputHtml").contentWindow.document.write(x + "\n");
+                document.getElementById("outputHtml").contentWindow.document.write(str);
             } else {
-                document.getElementById("output").value += x + "\n";
+                document.getElementById("output").value += str;
             }
         }
     </script>
-    <script src="php.js"></script>
-    <script>window.php = Module.cwrap('run_php', 'number', ['string'])</script>
+    <!-- <script src="php.js"></script> -->
+    <script>
+        const myWorker = new Worker("worker.js");
+        myWorker.postMessage("echo 1;");
+
+        myWorker.onmessage = e => {
+            console.log({line: 22, e});
+        }
+
+        window.submit = async () => {
+            // Clear old output
+            output = "";
+            document.getElementById('output').value='';
+            document.getElementById('outputHtml').src='';
+            // await php(document.getElementById("input").value)
+        }
+    </script>
 </head>
 
 <body>
-    <textarea id="input"></textarea>
-    <button onclick="document.getElementById('output').value='';document.getElementById('outputHtml').src='';setTimeout(() => php(document.getElementById('input').value), 10)">Submit</button>
+    <textarea id="input">phpinfo();</textarea>
+    <button onclick="submit()">Submit</button>
     <label><input type="radio" name="type" onclick="html=false;document.querySelector('#output').style.display='block';document.querySelector('#outputHtml').style.display='none';">Text</label>
     <label><input type="radio" name="type" checked onclick="html=true;document.querySelector('#outputHtml').style.display='block';document.querySelector('#output').style.display='none';">HTML</label>
     <br>
     <textarea id="output" readonly style="display:none;width: 95vw; height:75vh;"></textarea>
     <iframe id="outputHtml" style="width: 95vw; height:75vh;"></iframe>
-    <script>setTimeout(() => php("phpinfo();"), 1000)</script>
+    <script>submit(); // submit first time</script>
 </body>
 
 </html>
