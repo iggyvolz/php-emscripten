@@ -1,5 +1,5 @@
 FROM emscripten/emsdk AS build
-ARG VERSION=8.1.0RC4
+ARG VERSION=8.1.0RC6
 WORKDIR /usr/src
 RUN wget https://downloads.php.net/~ramsey/php-${VERSION}.tar.xz
 RUN tar xf php-$VERSION.tar.xz
