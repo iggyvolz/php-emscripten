@@ -278,8 +278,6 @@ if (ENVIRONMENT_IS_WEB || ENVIRONMENT_IS_WORKER) {
   throw new Error('environment detection error');
 }
 
-// Set up the out() and err() hooks, which are how we can print to stdout or
-// stderr, respectively.
 var out = Module['print'] || console.log.bind(console);
 var err = Module['printErr'] || console.warn.bind(console);
 
@@ -388,6 +386,10 @@ assert(!ENVIRONMENT_IS_SHELL, "shell environment detected but not enabled at bui
 
 var STACK_ALIGN = 16;
 
+function getPointerSize() {
+  return 4;
+}
+
 function getNativeTypeSize(type) {
   switch (type) {
     case 'i1': case 'i8': return 1;
@@ -398,7 +400,7 @@ function getNativeTypeSize(type) {
     case 'double': return 8;
     default: {
       if (type[type.length-1] === '*') {
-        return 4; // A pointer
+        return getPointerSize();
       } else if (type[0] === 'i') {
         var bits = Number(type.substr(1));
         assert(bits % 8 === 0, 'getNativeTypeSize invalid bits ' + bits + ', type ' + type);
@@ -527,19 +529,26 @@ function getEmptyTableSlot() {
   return wasmTable.length - 1;
 }
 
-// Add a wasm function to the table.
-function addFunctionWasm(func, sig) {
+function updateTableMap(offset, count) {
+  for (var i = offset; i < offset + count; i++) {
+    var item = getWasmTableEntry(i);
+    // Ignore null values.
+    if (item) {
+      functionsInTableMap.set(item, i);
+    }
+  }
+}
+
+// Add a function to the table.
+// 'sig' parameter is required if the function being added is a JS function.
+function addFunction(func, sig) {
+  assert(typeof func !== 'undefined');
+
   // Check if the function is already in the table, to ensure each function
   // gets a unique index. First, create the map if this is the first use.
   if (!functionsInTableMap) {
     functionsInTableMap = new WeakMap();
-    for (var i = 0; i < wasmTable.length; i++) {
-      var item = wasmTable.get(i);
-      // Ignore null values.
-      if (item) {
-        functionsInTableMap.set(item, i);
-      }
-    }
+    updateTableMap(0, wasmTable.length);
   }
   if (functionsInTableMap.has(func)) {
     return functionsInTableMap.get(func);
@@ -552,14 +561,14 @@ function addFunctionWasm(func, sig) {
   // Set the new value.
   try {
     // Attempting to call this with JS function will cause of table.set() to fail
-    wasmTable.set(ret, func);
+    setWasmTableEntry(ret, func);
   } catch (err) {
     if (!(err instanceof TypeError)) {
       throw err;
     }
     assert(typeof sig !== 'undefined', 'Missing signature argument to addFunction: ' + func);
     var wrapped = convertJsFunctionToWasm(func, sig);
-    wasmTable.set(ret, wrapped);
+    setWasmTableEntry(ret, wrapped);
   }
 
   functionsInTableMap.set(func, ret);
@@ -568,16 +577,8 @@ function addFunctionWasm(func, sig) {
 }
 
 function removeFunction(index) {
-  functionsInTableMap.delete(wasmTable.get(index));
+  functionsInTableMap.delete(getWasmTableEntry(index));
   freeTableIndexes.push(index);
-}
-
-// 'sig' parameter is required for the llvm backend but only when func is not
-// already a WebAssembly function.
-function addFunction(func, sig) {
-  assert(typeof func !== 'undefined');
-
-  return addFunctionWasm(func, sig);
 }
 
 // end include: runtime_functions.js
@@ -643,7 +644,7 @@ if (typeof WebAssembly !== 'object') {
     @param {number|boolean=} noSafe */
 function setValue(ptr, value, type, noSafe) {
   type = type || 'i8';
-  if (type.charAt(type.length-1) === '*') type = 'i32'; // pointers are 32-bit
+  if (type.charAt(type.length-1) === '*') type = 'i32';
     switch (type) {
       case 'i1': HEAP8[((ptr)>>0)] = value; break;
       case 'i8': HEAP8[((ptr)>>0)] = value; break;
@@ -661,7 +662,7 @@ function setValue(ptr, value, type, noSafe) {
     @param {number|boolean=} noSafe */
 function getValue(ptr, type, noSafe) {
   type = type || 'i8';
-  if (type.charAt(type.length-1) === '*') type = 'i32'; // pointers are 32-bit
+  if (type.charAt(type.length-1) === '*') type = 'i32';
     switch (type) {
       case 'i1': return HEAP8[((ptr)>>0)];
       case 'i8': return HEAP8[((ptr)>>0)];
@@ -669,7 +670,7 @@ function getValue(ptr, type, noSafe) {
       case 'i32': return HEAP32[((ptr)>>2)];
       case 'i64': return HEAP32[((ptr)>>2)];
       case 'float': return HEAPF32[((ptr)>>2)];
-      case 'double': return HEAPF64[((ptr)>>3)];
+      case 'double': return Number(HEAPF64[((ptr)>>3)]);
       default: abort('invalid type for getValue: ' + type);
     }
   return null;
@@ -877,6 +878,7 @@ function UTF8ArrayToString(heap, idx, maxBytesToRead) {
  * @return {string}
  */
 function UTF8ToString(ptr, maxBytesToRead) {
+  ;
   return ptr ? UTF8ArrayToString(HEAPU8, ptr, maxBytesToRead) : '';
 }
 
@@ -1181,7 +1183,7 @@ function writeArrayToMemory(array, buffer) {
 /** @param {boolean=} dontAddNull */
 function writeAsciiToMemory(str, buffer, dontAddNull) {
   for (var i = 0; i < str.length; ++i) {
-    assert(str.charCodeAt(i) === str.charCodeAt(i)&0xff);
+    assert(str.charCodeAt(i) === (str.charCodeAt(i) & 0xff));
     HEAP8[((buffer++)>>0)] = str.charCodeAt(i);
   }
   // Null-terminate the pointer to the HEAP.
@@ -1268,8 +1270,8 @@ function writeStackCookie() {
   var max = _emscripten_stack_get_end();
   assert((max & 3) == 0);
   // The stack grows downwards
-  HEAPU32[(max >> 2)+1] = 0x2135467;
-  HEAPU32[(max >> 2)+2] = 0x89BACDFE;
+  HEAP32[((max + 4)>>2)] = 0x2135467
+  HEAP32[((max + 8)>>2)] = 0x89BACDFE
   // Also test the global address 0 for integrity.
   HEAP32[0] = 0x63736d65; /* 'emsc' */
 }
@@ -1277,8 +1279,8 @@ function writeStackCookie() {
 function checkStackCookie() {
   if (ABORT) return;
   var max = _emscripten_stack_get_end();
-  var cookie1 = HEAPU32[(max >> 2)+1];
-  var cookie2 = HEAPU32[(max >> 2)+2];
+  var cookie1 = HEAPU32[((max + 4)>>2)];
+  var cookie2 = HEAPU32[((max + 8)>>2)];
   if (cookie1 != 0x2135467 || cookie2 != 0x89BACDFE) {
     abort('Stack overflow! Stack cookie has been overwritten, expected hex dwords 0x89BACDFE and 0x2135467, but received 0x' + cookie2.toString(16) + ' ' + cookie1.toString(16));
   }
@@ -1730,9 +1732,9 @@ var ASM_CONSTS = {
         var func = callback.func;
         if (typeof func === 'number') {
           if (callback.arg === undefined) {
-            wasmTable.get(func)();
+            getWasmTableEntry(func)();
           } else {
-            wasmTable.get(func)(callback.arg);
+            getWasmTableEntry(func)(callback.arg);
           }
         } else {
           func(callback.arg === undefined ? null : callback.arg);
@@ -1740,6 +1742,12 @@ var ASM_CONSTS = {
       }
     }
 
+  function withStackSave(f) {
+      var stack = stackSave();
+      var ret = f();
+      stackRestore(stack);
+      return ret;
+    }
   function demangle(func) {
       warnOnce('warning: build with  -s DEMANGLE_SUPPORT=1  to link in libcxxabi demangling');
       return func;
@@ -1753,6 +1761,17 @@ var ASM_CONSTS = {
           var y = demangle(x);
           return x === y ? x : (y + ' [' + x + ']');
         });
+    }
+
+  var wasmTableMirror = [];
+  function getWasmTableEntry(funcPtr) {
+      var func = wasmTableMirror[funcPtr];
+      if (!func) {
+        if (funcPtr >= wasmTableMirror.length) wasmTableMirror.length = funcPtr + 1;
+        wasmTableMirror[funcPtr] = func = wasmTable.get(funcPtr);
+      }
+      assert(wasmTable.get(funcPtr) == func, "JavaScript-side Wasm function table mirror is out of date!");
+      return func;
     }
 
   function handleException(e) {
@@ -1782,6 +1801,11 @@ var ASM_CONSTS = {
         }
       }
       return error.stack.toString();
+    }
+
+  function setWasmTableEntry(idx, func) {
+      wasmTable.set(idx, func);
+      wasmTableMirror[idx] = func;
     }
 
   function stackTrace() {
@@ -1908,7 +1932,7 @@ var ASM_CONSTS = {
     }
 
   function ___call_sighandler(fp, sig) {
-      wasmTable.get(fp)(sig);
+      getWasmTableEntry(fp)(sig);
     }
 
   var _emscripten_get_now;if (ENVIRONMENT_IS_NODE) {
@@ -3370,10 +3394,13 @@ var ASM_CONSTS = {
         var stream = FS.createStream({
           node: node,
           path: FS.getPath(node),  // we want the absolute path to the node
+          id: node.id,
           flags: flags,
+          mode: node.mode,
           seekable: true,
           position: 0,
           stream_ops: node.stream_ops,
+          node_ops: node.node_ops,
           // used by the file family libc calls (fopen, fwrite, ferror, etc.)
           ungotten: [],
           error: false
@@ -4148,7 +4175,7 @@ var ASM_CONSTS = {
       },standardizePath:function() {
         abort('FS.standardizePath has been removed; use PATH.normalize instead');
       }};
-  var SYSCALLS = {mappings:{},DEFAULT_POLLMASK:5,umask:511,calculateAt:function(dirfd, path, allowEmpty) {
+  var SYSCALLS = {mappings:{},DEFAULT_POLLMASK:5,calculateAt:function(dirfd, path, allowEmpty) {
         if (path[0] === '/') {
           return path;
         }
@@ -4294,7 +4321,7 @@ var ASM_CONSTS = {
         else assert(high === -1);
         return low;
       }};
-  function ___sys__newselect(nfds, readfds, writefds, exceptfds, timeout) {try {
+  function ___syscall__newselect(nfds, readfds, writefds, exceptfds, timeout) {try {
   
       // readfds are supported,
       // writefds checks socket open status
@@ -5126,7 +5153,7 @@ var ASM_CONSTS = {
   
         return null;
       }};
-  function ___sys_accept4(fd, addr, addrlen, flags) {try {
+  function ___syscall_accept4(fd, addr, addrlen, flags) {try {
   
       var sock = getSocketFromFD(fd);
       var newsock = sock.sock_ops.accept(sock);
@@ -5141,7 +5168,7 @@ var ASM_CONSTS = {
   }
   }
 
-  function ___sys_access(path, amode) {try {
+  function ___syscall_access(path, amode) {try {
   
       path = SYSCALLS.getStr(path);
       return SYSCALLS.doAccess(path, amode);
@@ -5290,7 +5317,7 @@ var ASM_CONSTS = {
       info.addr = DNS.lookup_addr(info.addr) || info.addr;
       return info;
     }
-  function ___sys_bind(fd, addr, addrlen) {try {
+  function ___syscall_bind(fd, addr, addrlen) {try {
   
       var sock = getSocketFromFD(fd);
       var info = getSocketAddress(addr, addrlen);
@@ -5302,7 +5329,7 @@ var ASM_CONSTS = {
   }
   }
 
-  function ___sys_chdir(path) {try {
+  function ___syscall_chdir(path) {try {
   
       path = SYSCALLS.getStr(path);
       FS.chdir(path);
@@ -5313,7 +5340,7 @@ var ASM_CONSTS = {
   }
   }
 
-  function ___sys_chmod(path, mode) {try {
+  function ___syscall_chmod(path, mode) {try {
   
       path = SYSCALLS.getStr(path);
       FS.chmod(path, mode);
@@ -5324,7 +5351,7 @@ var ASM_CONSTS = {
   }
   }
 
-  function ___sys_chown32(path, owner, group) {try {
+  function ___syscall_chown32(path, owner, group) {try {
   
       path = SYSCALLS.getStr(path);
       FS.chown(path, owner, group);
@@ -5335,7 +5362,7 @@ var ASM_CONSTS = {
   }
   }
 
-  function ___sys_connect(fd, addr, addrlen) {try {
+  function ___syscall_connect(fd, addr, addrlen) {try {
   
       var sock = getSocketFromFD(fd);
       var info = getSocketAddress(addr, addrlen);
@@ -5347,7 +5374,7 @@ var ASM_CONSTS = {
   }
   }
 
-  function ___sys_dup(fd) {try {
+  function ___syscall_dup(fd) {try {
   
       var old = SYSCALLS.getStreamFromFD(fd);
       return FS.open(old.path, old.flags, 0).fd;
@@ -5357,10 +5384,11 @@ var ASM_CONSTS = {
   }
   }
 
-  function ___sys_dup2(oldfd, suggestFD) {try {
+  function ___syscall_dup3(fd, suggestFD, flags) {try {
   
-      var old = SYSCALLS.getStreamFromFD(oldfd);
-      if (old.fd === suggestFD) return suggestFD;
+      var old = SYSCALLS.getStreamFromFD(fd);
+      assert(!flags);
+      if (old.fd === suggestFD) return -28;
       return SYSCALLS.doDup(old.path, old.flags, suggestFD);
     } catch (e) {
     if (typeof FS === 'undefined' || !(e instanceof FS.ErrnoError)) abort(e);
@@ -5368,7 +5396,7 @@ var ASM_CONSTS = {
   }
   }
 
-  function ___sys_fcntl64(fd, cmd, varargs) {SYSCALLS.varargs = varargs;
+  function ___syscall_fcntl64(fd, cmd, varargs) {SYSCALLS.varargs = varargs;
   try {
   
       var stream = SYSCALLS.getStreamFromFD(fd);
@@ -5425,7 +5453,7 @@ var ASM_CONSTS = {
   }
   }
 
-  function ___sys_fdatasync(fd) {try {
+  function ___syscall_fdatasync(fd) {try {
   
       var stream = SYSCALLS.getStreamFromFD(fd);
       return 0; // we can't do anything synchronously; the in-memory FS is already synced to
@@ -5435,7 +5463,7 @@ var ASM_CONSTS = {
   }
   }
 
-  function ___sys_fstat64(fd, buf) {try {
+  function ___syscall_fstat64(fd, buf) {try {
   
       var stream = SYSCALLS.getStreamFromFD(fd);
       return SYSCALLS.doStat(FS.stat, stream.path, buf);
@@ -5445,7 +5473,7 @@ var ASM_CONSTS = {
   }
   }
 
-  function ___sys_ftruncate64(fd, zero, low, high) {try {
+  function ___syscall_ftruncate64(fd, low, high) {try {
   
       var length = SYSCALLS.get64(low, high);
       FS.ftruncate(fd, length);
@@ -5456,7 +5484,7 @@ var ASM_CONSTS = {
   }
   }
 
-  function ___sys_getcwd(buf, size) {try {
+  function ___syscall_getcwd(buf, size) {try {
   
       if (size === 0) return -28;
       var cwd = FS.cwd();
@@ -5470,7 +5498,7 @@ var ASM_CONSTS = {
   }
   }
 
-  function ___sys_getdents64(fd, dirp, count) {try {
+  function ___syscall_getdents64(fd, dirp, count) {try {
   
       var stream = SYSCALLS.getStreamFromFD(fd)
       if (!stream.getdents) {
@@ -5487,11 +5515,16 @@ var ASM_CONSTS = {
         var id;
         var type;
         var name = stream.getdents[idx];
-        if (name[0] === '.') {
-          id = 1;
+        if (name === '.') {
+          id = stream.id;
           type = 4; // DT_DIR
-        } else {
-          var child = FS.lookupNode(stream.node, name);
+        }
+        else if (name === '..') {
+          id = FS.lookupPath(stream.path, { parent: true }).id;
+          type = 4; // DT_DIR
+        }
+        else {
+          var child = FS.lookupNode(stream, name);
           id = child.id;
           type = FS.isChrdev(child.mode) ? 2 :  // DT_CHR, character device.
                  FS.isDir(child.mode) ? 4 :     // DT_DIR, directory.
@@ -5514,21 +5547,15 @@ var ASM_CONSTS = {
   }
   }
 
-  function ___sys_getegid32() {
+  function ___syscall_getegid32() {
       return 0;
     }
-  function ___sys_getgid32(
+  function ___syscall_getgid32(
   ) {
-  return ___sys_getegid32();
+  return ___syscall_getegid32();
   }
 
-  function ___sys_getgroups32(size, list) {
-      if (size < 1) return -28;
-      HEAP32[((list)>>2)] = 0;
-      return 1;
-    }
-
-  function ___sys_getpeername(fd, addr, addrlen) {try {
+  function ___syscall_getpeername(fd, addr, addrlen) {try {
   
       var sock = getSocketFromFD(fd);
       if (!sock.daddr) {
@@ -5543,31 +5570,9 @@ var ASM_CONSTS = {
   }
   }
 
-  function ___sys_getpid() {
-      return 42;
-    }
-
-  var ___sys_getrusage = function(who, usage) {
-    
-    err('warning: unsupported syscall: __sys_getrusage');try {
+  function ___syscall_getsockname(fd, addr, addrlen) {try {
   
-      zeroMemory(usage, 136);
-      HEAP32[((usage)>>2)] = 1; // fake some values
-      HEAP32[(((usage)+(4))>>2)] = 2;
-      HEAP32[(((usage)+(8))>>2)] = 3;
-      HEAP32[(((usage)+(12))>>2)] = 4;
-      return 0;
-    } catch (e) {
-    if (typeof FS === 'undefined' || !(e instanceof FS.ErrnoError)) abort(e);
-    return -e.errno;
-  }
-  
-  }
-  ;
-
-  function ___sys_getsockname(fd, addr, addrlen) {try {
-  
-      err("__sys_getsockname " + fd);
+      err("__syscall_getsockname " + fd);
       var sock = getSocketFromFD(fd);
       // TODO: sock.saddr should never be undefined, see TODO in websocket_sock_ops.getname
       var errno = writeSockaddr(addr, sock.family, DNS.lookup_name(sock.saddr || '0.0.0.0'), sock.sport, addrlen);
@@ -5579,7 +5584,7 @@ var ASM_CONSTS = {
   }
   }
 
-  function ___sys_getsockopt(fd, level, optname, optval, optlen) {try {
+  function ___syscall_getsockopt(fd, level, optname, optval, optlen) {try {
   
       var sock = getSocketFromFD(fd);
       // Minimal getsockopt aimed at resolving https://github.com/emscripten-core/emscripten/issues/2211
@@ -5599,12 +5604,12 @@ var ASM_CONSTS = {
   }
   }
 
-  function ___sys_getuid32(
+  function ___syscall_getuid32(
   ) {
-  return ___sys_getegid32();
+  return ___syscall_getegid32();
   }
 
-  function ___sys_ioctl(fd, op, varargs) {SYSCALLS.varargs = varargs;
+  function ___syscall_ioctl(fd, op, varargs) {SYSCALLS.varargs = varargs;
   try {
   
       var stream = SYSCALLS.getStreamFromFD(fd);
@@ -5658,7 +5663,7 @@ var ASM_CONSTS = {
   }
   }
 
-  function ___sys_lchown32(path, owner, group) {try {
+  function ___syscall_lchown32(path, owner, group) {try {
   
       path = SYSCALLS.getStr(path);
       FS.chown(path, owner, group); // XXX we ignore the 'l' aspect, and do the same as chown
@@ -5669,11 +5674,7 @@ var ASM_CONSTS = {
   }
   }
 
-  function ___sys_link(oldpath, newpath) {
-      return -34; // no hardlinks for us
-    }
-
-  function ___sys_listen(fd, backlog) {try {
+  function ___syscall_listen(fd, backlog) {try {
   
       var sock = getSocketFromFD(fd);
       sock.sock_ops.listen(sock, backlog);
@@ -5684,7 +5685,7 @@ var ASM_CONSTS = {
   }
   }
 
-  function ___sys_lstat64(path, buf) {try {
+  function ___syscall_lstat64(path, buf) {try {
   
       path = SYSCALLS.getStr(path);
       return SYSCALLS.doStat(FS.lstat, path, buf);
@@ -5694,21 +5695,7 @@ var ASM_CONSTS = {
   }
   }
 
-  var ___sys_madvise1 = function(addr, length, advice) {
-    
-    err('warning: unsupported syscall: __sys_madvise1');try {
-  
-      // advice is welcome, but ignored
-      return 0;
-    } catch (e) {
-    if (typeof FS === 'undefined' || !(e instanceof FS.ErrnoError)) abort(e);
-    return -e.errno;
-  }
-  
-  }
-  ;
-
-  function ___sys_mkdir(path, mode) {try {
+  function ___syscall_mkdir(path, mode) {try {
   
       path = SYSCALLS.getStr(path);
       return SYSCALLS.doMkdir(path, mode);
@@ -5745,7 +5732,7 @@ var ASM_CONSTS = {
       SYSCALLS.mappings[ptr] = { malloc: ptr, len: len, allocated: allocated, fd: fd, prot: prot, flags: flags, offset: off };
       return ptr;
     }
-  function ___sys_mmap2(addr, len, prot, flags, fd, off) {try {
+  function ___syscall_mmap2(addr, len, prot, flags, fd, off) {try {
   
       return syscallMmap2(addr, len, prot, flags, fd, off);
     } catch (e) {
@@ -5753,19 +5740,6 @@ var ASM_CONSTS = {
     return -e.errno;
   }
   }
-
-  var ___sys_mprotect = function(addr, len, size) {
-    
-    err('warning: unsupported syscall: __sys_mprotect');try {
-  
-      return 0; // let's not and say we did
-    } catch (e) {
-    if (typeof FS === 'undefined' || !(e instanceof FS.ErrnoError)) abort(e);
-    return -e.errno;
-  }
-  
-  }
-  ;
 
   function syscallMunmap(addr, len) {
       // TODO: support unmmap'ing parts of allocations
@@ -5788,7 +5762,7 @@ var ASM_CONSTS = {
       }
       return 0;
     }
-  function ___sys_munmap(addr, len) {try {
+  function ___syscall_munmap(addr, len) {try {
   
       return syscallMunmap(addr, len);
     } catch (e) {
@@ -5797,11 +5771,7 @@ var ASM_CONSTS = {
   }
   }
 
-  function ___sys_nice(inc) {
-      return -63; // no meaning to nice for our single-process environment
-    }
-
-  function ___sys_open(path, flags, varargs) {SYSCALLS.varargs = varargs;
+  function ___syscall_open(path, flags, varargs) {SYSCALLS.varargs = varargs;
   try {
   
       var pathname = SYSCALLS.getStr(path);
@@ -6015,7 +5985,7 @@ var ASM_CONSTS = {
         }
         return 'pipe[' + (PIPEFS.nextname.current++) + ']';
       }};
-  function ___sys_pipe(fdPtr) {try {
+  function ___syscall_pipe(fdPtr) {try {
   
       if (fdPtr == 0) {
         throw new FS.ErrnoError(21);
@@ -6033,7 +6003,7 @@ var ASM_CONSTS = {
   }
   }
 
-  function ___sys_poll(fds, nfds, timeout) {try {
+  function ___syscall_poll(fds, nfds, timeout) {try {
   
       var nonzero = 0;
       for (var i = 0; i < nfds; i++) {
@@ -6059,7 +6029,7 @@ var ASM_CONSTS = {
   }
   }
 
-  function ___sys_readlink(path, buf, bufsize) {try {
+  function ___syscall_readlink(path, buf, bufsize) {try {
   
       path = SYSCALLS.getStr(path);
       return SYSCALLS.doReadlink(path, buf, bufsize);
@@ -6069,7 +6039,7 @@ var ASM_CONSTS = {
   }
   }
 
-  function ___sys_recvfrom(fd, buf, len, flags, addr, addrlen) {try {
+  function ___syscall_recvfrom(fd, buf, len, flags, addr, addrlen) {try {
   
       var sock = getSocketFromFD(fd);
       var msg = sock.sock_ops.recvmsg(sock, len);
@@ -6086,7 +6056,7 @@ var ASM_CONSTS = {
   }
   }
 
-  function ___sys_rename(old_path, new_path) {try {
+  function ___syscall_rename(old_path, new_path) {try {
   
       old_path = SYSCALLS.getStr(old_path);
       new_path = SYSCALLS.getStr(new_path);
@@ -6098,7 +6068,7 @@ var ASM_CONSTS = {
   }
   }
 
-  function ___sys_rmdir(path) {try {
+  function ___syscall_rmdir(path) {try {
   
       path = SYSCALLS.getStr(path);
       FS.rmdir(path);
@@ -6109,7 +6079,7 @@ var ASM_CONSTS = {
   }
   }
 
-  function ___sys_sendto(fd, message, length, flags, addr, addr_len) {try {
+  function ___syscall_sendto(fd, message, length, flags, addr, addr_len) {try {
   
       var sock = getSocketFromFD(fd);
       var dest = getSocketAddress(addr, addr_len, true);
@@ -6126,39 +6096,7 @@ var ASM_CONSTS = {
   }
   }
 
-  var ___sys_setitimer = function() {
-    
-    err('warning: unsupported syscall: __sys_setitimer');return -52;
-  };
-
-  var ___sys_setsockopt = function(fd) {
-    
-    err('warning: unsupported syscall: __sys_setsockopt');try {
-  
-      return -50; // The option is unknown at the level indicated.
-    } catch (e) {
-    if (typeof FS === 'undefined' || !(e instanceof FS.ErrnoError)) abort(e);
-    return -e.errno;
-  }
-  
-  }
-  ;
-
-  var ___sys_shutdown = function(fd, how) {
-    
-    err('warning: unsupported syscall: __sys_shutdown');try {
-  
-      getSocketFromFD(fd);
-      return -52; // unsupported feature
-    } catch (e) {
-    if (typeof FS === 'undefined' || !(e instanceof FS.ErrnoError)) abort(e);
-    return -e.errno;
-  }
-  
-  }
-  ;
-
-  function ___sys_socket(domain, type, protocol) {try {
+  function ___syscall_socket(domain, type, protocol) {try {
   
       var sock = SOCKFS.createSocket(domain, type, protocol);
       assert(sock.stream.fd < 64); // XXX ? select() assumes socket fd values are in 0..63
@@ -6169,12 +6107,7 @@ var ASM_CONSTS = {
   }
   }
 
-  var ___sys_socketpair = function() {
-    
-    err('warning: unsupported syscall: __sys_socketpair');return -52;
-  };
-
-  function ___sys_stat64(path, buf) {try {
+  function ___syscall_stat64(path, buf) {try {
   
       path = SYSCALLS.getStr(path);
       return SYSCALLS.doStat(FS.stat, path, buf);
@@ -6184,7 +6117,7 @@ var ASM_CONSTS = {
   }
   }
 
-  function ___sys_statfs64(path, size, buf) {try {
+  function ___syscall_statfs64(path, size, buf) {try {
   
       path = SYSCALLS.getStr(path);
       assert(size === 64);
@@ -6207,7 +6140,7 @@ var ASM_CONSTS = {
   }
   }
 
-  function ___sys_symlink(target, linkpath) {try {
+  function ___syscall_symlink(target, linkpath) {try {
   
       target = SYSCALLS.getStr(target);
       linkpath = SYSCALLS.getStr(linkpath);
@@ -6219,38 +6152,7 @@ var ASM_CONSTS = {
   }
   }
 
-  function ___sys_umask(mask) {try {
-  
-      var old = SYSCALLS.umask;
-      SYSCALLS.umask = mask;
-      return old;
-    } catch (e) {
-    if (typeof FS === 'undefined' || !(e instanceof FS.ErrnoError)) abort(e);
-    return -e.errno;
-  }
-  }
-
-  function ___sys_uname(buf) {try {
-  
-      if (!buf) return -21
-      var layout = {"__size__":390,"domainname":325,"machine":260,"nodename":65,"release":130,"sysname":0,"version":195};
-      var copyString = function(element, value) {
-        var offset = layout[element];
-        writeAsciiToMemory(value, buf + offset);
-      };
-      copyString('sysname', 'Emscripten');
-      copyString('nodename', 'emscripten');
-      copyString('release', '1.0');
-      copyString('version', '#1');
-      copyString('machine', 'wasm32');
-      return 0;
-    } catch (e) {
-    if (typeof FS === 'undefined' || !(e instanceof FS.ErrnoError)) abort(e);
-    return -e.errno;
-  }
-  }
-
-  function ___sys_unlink(path) {try {
+  function ___syscall_unlink(path) {try {
   
       path = SYSCALLS.getStr(path);
       FS.unlink(path);
@@ -6260,11 +6162,6 @@ var ASM_CONSTS = {
     return -e.errno;
   }
   }
-
-  var ___sys_wait4 = function() {
-    
-    err('warning: unsupported syscall: __sys_wait4');return -52;
-  };
 
   function __dlopen_js(filename, flag) {
       abort("To use dlopen, you need to use Emscripten's linking support, see https://github.com/emscripten-core/emscripten/wiki/Linking");
@@ -6280,13 +6177,6 @@ var ASM_CONSTS = {
       abort('native code called abort()');
     }
 
-  function _chroot(path) {
-      // int chroot(const char *path);
-      // http://pubs.opengroup.org/onlinepubs/7908799/xsh/chroot.html
-      setErrNo(2);
-      return -1;
-    }
-
 
   function _difftime(time1, time0) {
       return time1 - time0;
@@ -6297,6 +6187,7 @@ var ASM_CONSTS = {
       // returning up to 4GB - one wasm page.
       return 2147483648;
     }
+
 
   function _emscripten_memcpy_big(dest, src, num) {
       HEAPU8.copyWithin(dest, src, src + num);
@@ -6360,13 +6251,6 @@ var ASM_CONSTS = {
       return false;
     }
 
-  function _emscripten_thread_sleep(msecs) {
-      var start = _emscripten_get_now();
-      while (_emscripten_get_now() - start < msecs) {
-        // Do nothing.
-      }
-    }
-
   var ENV = {};
   
   function getExecutableName() {
@@ -6422,15 +6306,6 @@ var ASM_CONSTS = {
       });
       HEAP32[((penviron_buf_size)>>2)] = bufSize;
       return 0;
-    }
-
-  function _execve(path, argv, envp) {
-      // int execve(const char *pathname, char *const argv[],
-      //            char *const envp[]);
-      // http://pubs.opengroup.org/onlinepubs/009695399/functions/exec.html
-      // We don't support executing external code.
-      setErrNo(45);
-      return -1;
     }
 
   function _exit(status) {
@@ -6521,6 +6396,7 @@ var ASM_CONSTS = {
 
   function _fd_write(fd, iov, iovcnt, pnum) {try {
   
+      ;
       var stream = SYSCALLS.getStreamFromFD(fd);
       var num = SYSCALLS.doWritev(stream, iov, iovcnt);
       HEAP32[((pnum)>>2)] = num
@@ -6530,20 +6406,6 @@ var ASM_CONSTS = {
     return e.errno;
   }
   }
-
-  function _flock(fd, operation) {
-      // int flock(int fd, int operation);
-      // Pretend to succeed
-      return 0;
-    }
-
-  function _fork() {
-      // pid_t fork(void);
-      // http://pubs.opengroup.org/onlinepubs/000095399/functions/fork.html
-      // We don't support multiple processes.
-      setErrNo(52);
-      return -1;
-    }
 
   var GAI_ERRNO_MESSAGES = {};
   function _gai_strerror(val) {
@@ -6765,8 +6627,6 @@ var ASM_CONSTS = {
   err('missing function: getdtablesize'); abort(-1);
   }
 
-  function _getgrnam() { throw 'getgrnam: TODO' }
-
   function getHostByName(name) {
       // generate hostent
       var ret = _malloc(20); // XXX possibly leaked, as are others here
@@ -6913,10 +6773,6 @@ var ASM_CONSTS = {
       return result;
     }
 
-  function _getpwnam() { throw 'getpwnam: TODO' }
-
-  function _getpwuid() { throw 'getpwuid: TODO' }
-
   function _gettimeofday(ptr) {
       var now = Date.now();
       HEAP32[((ptr)>>2)] = (now/1000)|0; // seconds
@@ -6978,16 +6834,6 @@ var ASM_CONSTS = {
   err('missing function: makecontext'); abort(-1);
   }
 
-
-  function _pclose(
-  ) {
-  return _fork();
-  }
-
-  function _popen(
-  ) {
-  return _fork();
-  }
 
   function _proc_exit(code) {
       procExit(code);
@@ -7604,6 +7450,7 @@ var ASM_CONSTS = {
   }
 
   function _time(ptr) {
+      ;
       var ret = (Date.now()/1000)|0;
       if (ptr) {
         HEAP32[((ptr)>>2)] = ret;
@@ -7624,6 +7471,7 @@ var ASM_CONSTS = {
       }
     }
   function _utime(path, times) {
+      ;
       // int utime(const char *path, const struct utimbuf *times);
       // http://pubs.opengroup.org/onlinepubs/009695399/basedefs/utime.h.html
       var time;
@@ -7839,75 +7687,59 @@ var asmLibraryArg = {
   "__assert_fail": ___assert_fail,
   "__call_sighandler": ___call_sighandler,
   "__clock_gettime": ___clock_gettime,
-  "__sys__newselect": ___sys__newselect,
-  "__sys_accept4": ___sys_accept4,
-  "__sys_access": ___sys_access,
-  "__sys_bind": ___sys_bind,
-  "__sys_chdir": ___sys_chdir,
-  "__sys_chmod": ___sys_chmod,
-  "__sys_chown32": ___sys_chown32,
-  "__sys_connect": ___sys_connect,
-  "__sys_dup": ___sys_dup,
-  "__sys_dup2": ___sys_dup2,
-  "__sys_fcntl64": ___sys_fcntl64,
-  "__sys_fdatasync": ___sys_fdatasync,
-  "__sys_fstat64": ___sys_fstat64,
-  "__sys_ftruncate64": ___sys_ftruncate64,
-  "__sys_getcwd": ___sys_getcwd,
-  "__sys_getdents64": ___sys_getdents64,
-  "__sys_getgid32": ___sys_getgid32,
-  "__sys_getgroups32": ___sys_getgroups32,
-  "__sys_getpeername": ___sys_getpeername,
-  "__sys_getpid": ___sys_getpid,
-  "__sys_getrusage": ___sys_getrusage,
-  "__sys_getsockname": ___sys_getsockname,
-  "__sys_getsockopt": ___sys_getsockopt,
-  "__sys_getuid32": ___sys_getuid32,
-  "__sys_ioctl": ___sys_ioctl,
-  "__sys_lchown32": ___sys_lchown32,
-  "__sys_link": ___sys_link,
-  "__sys_listen": ___sys_listen,
-  "__sys_lstat64": ___sys_lstat64,
-  "__sys_madvise1": ___sys_madvise1,
-  "__sys_mkdir": ___sys_mkdir,
-  "__sys_mmap2": ___sys_mmap2,
-  "__sys_mprotect": ___sys_mprotect,
-  "__sys_munmap": ___sys_munmap,
-  "__sys_nice": ___sys_nice,
-  "__sys_open": ___sys_open,
-  "__sys_pipe": ___sys_pipe,
-  "__sys_poll": ___sys_poll,
-  "__sys_readlink": ___sys_readlink,
-  "__sys_recvfrom": ___sys_recvfrom,
-  "__sys_rename": ___sys_rename,
-  "__sys_rmdir": ___sys_rmdir,
-  "__sys_sendto": ___sys_sendto,
-  "__sys_setitimer": ___sys_setitimer,
-  "__sys_setsockopt": ___sys_setsockopt,
-  "__sys_shutdown": ___sys_shutdown,
-  "__sys_socket": ___sys_socket,
-  "__sys_socketpair": ___sys_socketpair,
-  "__sys_stat64": ___sys_stat64,
-  "__sys_statfs64": ___sys_statfs64,
-  "__sys_symlink": ___sys_symlink,
-  "__sys_umask": ___sys_umask,
-  "__sys_uname": ___sys_uname,
-  "__sys_unlink": ___sys_unlink,
-  "__sys_wait4": ___sys_wait4,
+  "__syscall__newselect": ___syscall__newselect,
+  "__syscall_accept4": ___syscall_accept4,
+  "__syscall_access": ___syscall_access,
+  "__syscall_bind": ___syscall_bind,
+  "__syscall_chdir": ___syscall_chdir,
+  "__syscall_chmod": ___syscall_chmod,
+  "__syscall_chown32": ___syscall_chown32,
+  "__syscall_connect": ___syscall_connect,
+  "__syscall_dup": ___syscall_dup,
+  "__syscall_dup3": ___syscall_dup3,
+  "__syscall_fcntl64": ___syscall_fcntl64,
+  "__syscall_fdatasync": ___syscall_fdatasync,
+  "__syscall_fstat64": ___syscall_fstat64,
+  "__syscall_ftruncate64": ___syscall_ftruncate64,
+  "__syscall_getcwd": ___syscall_getcwd,
+  "__syscall_getdents64": ___syscall_getdents64,
+  "__syscall_getgid32": ___syscall_getgid32,
+  "__syscall_getpeername": ___syscall_getpeername,
+  "__syscall_getsockname": ___syscall_getsockname,
+  "__syscall_getsockopt": ___syscall_getsockopt,
+  "__syscall_getuid32": ___syscall_getuid32,
+  "__syscall_ioctl": ___syscall_ioctl,
+  "__syscall_lchown32": ___syscall_lchown32,
+  "__syscall_listen": ___syscall_listen,
+  "__syscall_lstat64": ___syscall_lstat64,
+  "__syscall_mkdir": ___syscall_mkdir,
+  "__syscall_mmap2": ___syscall_mmap2,
+  "__syscall_munmap": ___syscall_munmap,
+  "__syscall_open": ___syscall_open,
+  "__syscall_pipe": ___syscall_pipe,
+  "__syscall_poll": ___syscall_poll,
+  "__syscall_readlink": ___syscall_readlink,
+  "__syscall_recvfrom": ___syscall_recvfrom,
+  "__syscall_rename": ___syscall_rename,
+  "__syscall_rmdir": ___syscall_rmdir,
+  "__syscall_sendto": ___syscall_sendto,
+  "__syscall_socket": ___syscall_socket,
+  "__syscall_stat64": ___syscall_stat64,
+  "__syscall_statfs64": ___syscall_statfs64,
+  "__syscall_symlink": ___syscall_symlink,
+  "__syscall_unlink": ___syscall_unlink,
   "_dlopen_js": __dlopen_js,
   "_dlsym_js": __dlsym_js,
   "_emscripten_throw_longjmp": __emscripten_throw_longjmp,
   "abort": _abort,
-  "chroot": _chroot,
   "clock_gettime": _clock_gettime,
   "difftime": _difftime,
   "emscripten_get_heap_max": _emscripten_get_heap_max,
+  "emscripten_get_now": _emscripten_get_now,
   "emscripten_memcpy_big": _emscripten_memcpy_big,
   "emscripten_resize_heap": _emscripten_resize_heap,
-  "emscripten_thread_sleep": _emscripten_thread_sleep,
   "environ_get": _environ_get,
   "environ_sizes_get": _environ_sizes_get,
-  "execve": _execve,
   "exit": _exit,
   "fd_close": _fd_close,
   "fd_fdstat_get": _fd_fdstat_get,
@@ -7915,21 +7747,16 @@ var asmLibraryArg = {
   "fd_seek": _fd_seek,
   "fd_sync": _fd_sync,
   "fd_write": _fd_write,
-  "flock": _flock,
-  "fork": _fork,
   "gai_strerror": _gai_strerror,
   "getTempRet0": _getTempRet0,
   "getaddrinfo": _getaddrinfo,
   "getcontext": _getcontext,
   "getdtablesize": _getdtablesize,
-  "getgrnam": _getgrnam,
   "gethostbyname_r": _gethostbyname_r,
   "getloadavg": _getloadavg,
   "getnameinfo": _getnameinfo,
   "getprotobyname": _getprotobyname,
   "getprotobynumber": _getprotobynumber,
-  "getpwnam": _getpwnam,
-  "getpwuid": _getpwuid,
   "gettimeofday": _gettimeofday,
   "gmtime_r": _gmtime_r,
   "invoke_i": invoke_i,
@@ -7949,8 +7776,6 @@ var asmLibraryArg = {
   "localtime_r": _localtime_r,
   "makecontext": _makecontext,
   "mktime": _mktime,
-  "pclose": _pclose,
-  "popen": _popen,
   "proc_exit": _proc_exit,
   "setTempRet0": _setTempRet0,
   "strftime": _strftime,
@@ -8043,7 +7868,7 @@ var dynCall_jiji = Module["dynCall_jiji"] = createExportWrapper("dynCall_jiji");
 function invoke_iii(index,a1,a2) {
   var sp = stackSave();
   try {
-    return wasmTable.get(index)(a1,a2);
+    return getWasmTableEntry(index)(a1,a2);
   } catch(e) {
     stackRestore(sp);
     if (e !== e+0 && e !== 'longjmp') throw e;
@@ -8054,7 +7879,7 @@ function invoke_iii(index,a1,a2) {
 function invoke_iiii(index,a1,a2,a3) {
   var sp = stackSave();
   try {
-    return wasmTable.get(index)(a1,a2,a3);
+    return getWasmTableEntry(index)(a1,a2,a3);
   } catch(e) {
     stackRestore(sp);
     if (e !== e+0 && e !== 'longjmp') throw e;
@@ -8065,7 +7890,7 @@ function invoke_iiii(index,a1,a2,a3) {
 function invoke_v(index) {
   var sp = stackSave();
   try {
-    wasmTable.get(index)();
+    getWasmTableEntry(index)();
   } catch(e) {
     stackRestore(sp);
     if (e !== e+0 && e !== 'longjmp') throw e;
@@ -8076,7 +7901,7 @@ function invoke_v(index) {
 function invoke_vii(index,a1,a2) {
   var sp = stackSave();
   try {
-    wasmTable.get(index)(a1,a2);
+    getWasmTableEntry(index)(a1,a2);
   } catch(e) {
     stackRestore(sp);
     if (e !== e+0 && e !== 'longjmp') throw e;
@@ -8087,7 +7912,7 @@ function invoke_vii(index,a1,a2) {
 function invoke_vi(index,a1) {
   var sp = stackSave();
   try {
-    wasmTable.get(index)(a1);
+    getWasmTableEntry(index)(a1);
   } catch(e) {
     stackRestore(sp);
     if (e !== e+0 && e !== 'longjmp') throw e;
@@ -8098,7 +7923,7 @@ function invoke_vi(index,a1) {
 function invoke_i(index) {
   var sp = stackSave();
   try {
-    return wasmTable.get(index)();
+    return getWasmTableEntry(index)();
   } catch(e) {
     stackRestore(sp);
     if (e !== e+0 && e !== 'longjmp') throw e;
@@ -8109,7 +7934,7 @@ function invoke_i(index) {
 function invoke_iiiii(index,a1,a2,a3,a4) {
   var sp = stackSave();
   try {
-    return wasmTable.get(index)(a1,a2,a3,a4);
+    return getWasmTableEntry(index)(a1,a2,a3,a4);
   } catch(e) {
     stackRestore(sp);
     if (e !== e+0 && e !== 'longjmp') throw e;
@@ -8120,7 +7945,7 @@ function invoke_iiiii(index,a1,a2,a3,a4) {
 function invoke_ii(index,a1) {
   var sp = stackSave();
   try {
-    return wasmTable.get(index)(a1);
+    return getWasmTableEntry(index)(a1);
   } catch(e) {
     stackRestore(sp);
     if (e !== e+0 && e !== 'longjmp') throw e;
@@ -8131,7 +7956,7 @@ function invoke_ii(index,a1) {
 function invoke_viiiiii(index,a1,a2,a3,a4,a5,a6) {
   var sp = stackSave();
   try {
-    wasmTable.get(index)(a1,a2,a3,a4,a5,a6);
+    getWasmTableEntry(index)(a1,a2,a3,a4,a5,a6);
   } catch(e) {
     stackRestore(sp);
     if (e !== e+0 && e !== 'longjmp') throw e;
@@ -8142,7 +7967,7 @@ function invoke_viiiiii(index,a1,a2,a3,a4,a5,a6) {
 function invoke_viiiii(index,a1,a2,a3,a4,a5) {
   var sp = stackSave();
   try {
-    wasmTable.get(index)(a1,a2,a3,a4,a5);
+    getWasmTableEntry(index)(a1,a2,a3,a4,a5);
   } catch(e) {
     stackRestore(sp);
     if (e !== e+0 && e !== 'longjmp') throw e;
@@ -8153,7 +7978,7 @@ function invoke_viiiii(index,a1,a2,a3,a4,a5) {
 function invoke_viidii(index,a1,a2,a3,a4,a5) {
   var sp = stackSave();
   try {
-    wasmTable.get(index)(a1,a2,a3,a4,a5);
+    getWasmTableEntry(index)(a1,a2,a3,a4,a5);
   } catch(e) {
     stackRestore(sp);
     if (e !== e+0 && e !== 'longjmp') throw e;
@@ -8164,7 +7989,7 @@ function invoke_viidii(index,a1,a2,a3,a4,a5) {
 function invoke_viii(index,a1,a2,a3) {
   var sp = stackSave();
   try {
-    wasmTable.get(index)(a1,a2,a3);
+    getWasmTableEntry(index)(a1,a2,a3);
   } catch(e) {
     stackRestore(sp);
     if (e !== e+0 && e !== 'longjmp') throw e;
@@ -8175,7 +8000,7 @@ function invoke_viii(index,a1,a2,a3) {
 function invoke_viiii(index,a1,a2,a3,a4) {
   var sp = stackSave();
   try {
-    wasmTable.get(index)(a1,a2,a3,a4);
+    getWasmTableEntry(index)(a1,a2,a3,a4);
   } catch(e) {
     stackRestore(sp);
     if (e !== e+0 && e !== 'longjmp') throw e;
@@ -8186,7 +8011,7 @@ function invoke_viiii(index,a1,a2,a3,a4) {
 function invoke_iiiiiii(index,a1,a2,a3,a4,a5,a6) {
   var sp = stackSave();
   try {
-    return wasmTable.get(index)(a1,a2,a3,a4,a5,a6);
+    return getWasmTableEntry(index)(a1,a2,a3,a4,a5,a6);
   } catch(e) {
     stackRestore(sp);
     if (e !== e+0 && e !== 'longjmp') throw e;
@@ -8252,6 +8077,7 @@ if (!Object.getOwnPropertyDescriptor(Module, "stringToNewUTF8")) Module["stringT
 if (!Object.getOwnPropertyDescriptor(Module, "setFileTime")) Module["setFileTime"] = function() { abort("'setFileTime' was not exported. add it to EXPORTED_RUNTIME_METHODS (see the FAQ)") };
 if (!Object.getOwnPropertyDescriptor(Module, "emscripten_realloc_buffer")) Module["emscripten_realloc_buffer"] = function() { abort("'emscripten_realloc_buffer' was not exported. add it to EXPORTED_RUNTIME_METHODS (see the FAQ)") };
 if (!Object.getOwnPropertyDescriptor(Module, "ENV")) Module["ENV"] = function() { abort("'ENV' was not exported. add it to EXPORTED_RUNTIME_METHODS (see the FAQ)") };
+if (!Object.getOwnPropertyDescriptor(Module, "withStackSave")) Module["withStackSave"] = function() { abort("'withStackSave' was not exported. add it to EXPORTED_RUNTIME_METHODS (see the FAQ)") };
 if (!Object.getOwnPropertyDescriptor(Module, "ERRNO_CODES")) Module["ERRNO_CODES"] = function() { abort("'ERRNO_CODES' was not exported. add it to EXPORTED_RUNTIME_METHODS (see the FAQ)") };
 if (!Object.getOwnPropertyDescriptor(Module, "ERRNO_MESSAGES")) Module["ERRNO_MESSAGES"] = function() { abort("'ERRNO_MESSAGES' was not exported. add it to EXPORTED_RUNTIME_METHODS (see the FAQ)") };
 if (!Object.getOwnPropertyDescriptor(Module, "setErrNo")) Module["setErrNo"] = function() { abort("'setErrNo' was not exported. add it to EXPORTED_RUNTIME_METHODS (see the FAQ)") };
@@ -8281,6 +8107,9 @@ if (!Object.getOwnPropertyDescriptor(Module, "dynCallLegacy")) Module["dynCallLe
 if (!Object.getOwnPropertyDescriptor(Module, "getDynCaller")) Module["getDynCaller"] = function() { abort("'getDynCaller' was not exported. add it to EXPORTED_RUNTIME_METHODS (see the FAQ)") };
 if (!Object.getOwnPropertyDescriptor(Module, "dynCall")) Module["dynCall"] = function() { abort("'dynCall' was not exported. add it to EXPORTED_RUNTIME_METHODS (see the FAQ)") };
 if (!Object.getOwnPropertyDescriptor(Module, "callRuntimeCallbacks")) Module["callRuntimeCallbacks"] = function() { abort("'callRuntimeCallbacks' was not exported. add it to EXPORTED_RUNTIME_METHODS (see the FAQ)") };
+if (!Object.getOwnPropertyDescriptor(Module, "wasmTableMirror")) Module["wasmTableMirror"] = function() { abort("'wasmTableMirror' was not exported. add it to EXPORTED_RUNTIME_METHODS (see the FAQ)") };
+if (!Object.getOwnPropertyDescriptor(Module, "setWasmTableEntry")) Module["setWasmTableEntry"] = function() { abort("'setWasmTableEntry' was not exported. add it to EXPORTED_RUNTIME_METHODS (see the FAQ)") };
+if (!Object.getOwnPropertyDescriptor(Module, "getWasmTableEntry")) Module["getWasmTableEntry"] = function() { abort("'getWasmTableEntry' was not exported. add it to EXPORTED_RUNTIME_METHODS (see the FAQ)") };
 if (!Object.getOwnPropertyDescriptor(Module, "handleException")) Module["handleException"] = function() { abort("'handleException' was not exported. add it to EXPORTED_RUNTIME_METHODS (see the FAQ)") };
 if (!Object.getOwnPropertyDescriptor(Module, "runtimeKeepalivePush")) Module["runtimeKeepalivePush"] = function() { abort("'runtimeKeepalivePush' was not exported. add it to EXPORTED_RUNTIME_METHODS (see the FAQ)") };
 if (!Object.getOwnPropertyDescriptor(Module, "runtimeKeepalivePop")) Module["runtimeKeepalivePop"] = function() { abort("'runtimeKeepalivePop' was not exported. add it to EXPORTED_RUNTIME_METHODS (see the FAQ)") };
@@ -8346,9 +8175,6 @@ if (!Object.getOwnPropertyDescriptor(Module, "battery")) Module["battery"] = fun
 if (!Object.getOwnPropertyDescriptor(Module, "registerBatteryEventCallback")) Module["registerBatteryEventCallback"] = function() { abort("'registerBatteryEventCallback' was not exported. add it to EXPORTED_RUNTIME_METHODS (see the FAQ)") };
 if (!Object.getOwnPropertyDescriptor(Module, "setCanvasElementSize")) Module["setCanvasElementSize"] = function() { abort("'setCanvasElementSize' was not exported. add it to EXPORTED_RUNTIME_METHODS (see the FAQ)") };
 if (!Object.getOwnPropertyDescriptor(Module, "getCanvasElementSize")) Module["getCanvasElementSize"] = function() { abort("'getCanvasElementSize' was not exported. add it to EXPORTED_RUNTIME_METHODS (see the FAQ)") };
-if (!Object.getOwnPropertyDescriptor(Module, "setImmediateWrapped")) Module["setImmediateWrapped"] = function() { abort("'setImmediateWrapped' was not exported. add it to EXPORTED_RUNTIME_METHODS (see the FAQ)") };
-if (!Object.getOwnPropertyDescriptor(Module, "clearImmediateWrapped")) Module["clearImmediateWrapped"] = function() { abort("'clearImmediateWrapped' was not exported. add it to EXPORTED_RUNTIME_METHODS (see the FAQ)") };
-if (!Object.getOwnPropertyDescriptor(Module, "polyfillSetImmediate")) Module["polyfillSetImmediate"] = function() { abort("'polyfillSetImmediate' was not exported. add it to EXPORTED_RUNTIME_METHODS (see the FAQ)") };
 if (!Object.getOwnPropertyDescriptor(Module, "demangle")) Module["demangle"] = function() { abort("'demangle' was not exported. add it to EXPORTED_RUNTIME_METHODS (see the FAQ)") };
 if (!Object.getOwnPropertyDescriptor(Module, "demangleAll")) Module["demangleAll"] = function() { abort("'demangleAll' was not exported. add it to EXPORTED_RUNTIME_METHODS (see the FAQ)") };
 if (!Object.getOwnPropertyDescriptor(Module, "jsStackTrace")) Module["jsStackTrace"] = function() { abort("'jsStackTrace' was not exported. add it to EXPORTED_RUNTIME_METHODS (see the FAQ)") };
@@ -8364,6 +8190,9 @@ if (!Object.getOwnPropertyDescriptor(Module, "readI53FromI64")) Module["readI53F
 if (!Object.getOwnPropertyDescriptor(Module, "readI53FromU64")) Module["readI53FromU64"] = function() { abort("'readI53FromU64' was not exported. add it to EXPORTED_RUNTIME_METHODS (see the FAQ)") };
 if (!Object.getOwnPropertyDescriptor(Module, "convertI32PairToI53")) Module["convertI32PairToI53"] = function() { abort("'convertI32PairToI53' was not exported. add it to EXPORTED_RUNTIME_METHODS (see the FAQ)") };
 if (!Object.getOwnPropertyDescriptor(Module, "convertU32PairToI53")) Module["convertU32PairToI53"] = function() { abort("'convertU32PairToI53' was not exported. add it to EXPORTED_RUNTIME_METHODS (see the FAQ)") };
+if (!Object.getOwnPropertyDescriptor(Module, "setImmediateWrapped")) Module["setImmediateWrapped"] = function() { abort("'setImmediateWrapped' was not exported. add it to EXPORTED_RUNTIME_METHODS (see the FAQ)") };
+if (!Object.getOwnPropertyDescriptor(Module, "clearImmediateWrapped")) Module["clearImmediateWrapped"] = function() { abort("'clearImmediateWrapped' was not exported. add it to EXPORTED_RUNTIME_METHODS (see the FAQ)") };
+if (!Object.getOwnPropertyDescriptor(Module, "polyfillSetImmediate")) Module["polyfillSetImmediate"] = function() { abort("'polyfillSetImmediate' was not exported. add it to EXPORTED_RUNTIME_METHODS (see the FAQ)") };
 if (!Object.getOwnPropertyDescriptor(Module, "uncaughtExceptionCount")) Module["uncaughtExceptionCount"] = function() { abort("'uncaughtExceptionCount' was not exported. add it to EXPORTED_RUNTIME_METHODS (see the FAQ)") };
 if (!Object.getOwnPropertyDescriptor(Module, "exceptionLast")) Module["exceptionLast"] = function() { abort("'exceptionLast' was not exported. add it to EXPORTED_RUNTIME_METHODS (see the FAQ)") };
 if (!Object.getOwnPropertyDescriptor(Module, "exceptionCaught")) Module["exceptionCaught"] = function() { abort("'exceptionCaught' was not exported. add it to EXPORTED_RUNTIME_METHODS (see the FAQ)") };
